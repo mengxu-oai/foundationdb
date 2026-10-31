@@ -126,7 +126,7 @@ std::string ResponseBase<T>::getCodeDescription() {
 	}
 }
 
-std::string computeMD5Sum(std::string content) {
+std::string computeMD5Sum(std::string_view content) {
 	MD5_CTX sum;
 	::MD5_Init(&sum);
 	::MD5_Update(&sum, content.data(), content.size());
@@ -267,7 +267,7 @@ Future<size_t> read_delimited_into_string(Reference<IConnection> conn,
                                           size_t pos) {
 	size_t sPos = pos;
 	int lookBack = strlen(delim) - 1;
-	ASSERT(lookBack >= 0);
+	ASSERT_GE(lookBack, 0);
 
 	while (true) {
 		size_t endPos = buf->find(delim, sPos);

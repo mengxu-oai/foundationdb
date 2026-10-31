@@ -328,8 +328,6 @@ CSimpleOpt::SOption g_rgBackupStatusOptions[] = {
 	{ OPT_PARENTPID, "--parentpid", SO_REQ_SEP },
 #endif
 	BACKUP_CLUSTER_FILE_OPTIONS,
-	{ OPT_ERRORLIMIT, "-e", SO_REQ_SEP },
-	{ OPT_ERRORLIMIT, "--errorlimit", SO_REQ_SEP },
 	BACKUP_TAG_OPTIONS,
 	BACKUP_LOG_OPTIONS,
 	BACKUP_QUIET_OPTIONS,
@@ -611,6 +609,7 @@ CSimpleOpt::SOption g_rgRestoreOptions[] = {
 	{ OPT_RESTORE_BEGIN_VERSION, "--begin-version", SO_REQ_SEP },
 	{ OPT_RESTORE_INCONSISTENT_SNAPSHOT_ONLY, "--inconsistent-snapshot-only", SO_NONE },
 	{ OPT_ENCRYPTION_KEY_FILE, "--encryption-key-file", SO_REQ_SEP },
+	{ OPT_JSON, "--json", SO_NONE },
 	TLS_OPTION_FLAGS,
 	SO_END_OF_OPTIONS
 };
@@ -675,6 +674,7 @@ CSimpleOpt::SOption g_rgDBStatusOptions[] = {
 	{ OPT_CRASHONERROR, "--crash", SO_NONE },
 	BACKUP_MEMORY_OPTIONS,
 	BACKUP_HELP_OPTIONS,
+	{ OPT_JSON, "--json", SO_NONE },
 	{ OPT_KNOB, "--knob-", SO_REQ_SEP },
 	TLS_OPTION_FLAGS,
 	SO_END_OF_OPTIONS
@@ -861,6 +861,12 @@ static void printBackupUsage(bool devhelp) {
 	       "                 FDB_CLUSTER_FILE environment variable, then `./fdb.cluster',\n"
 	       "                 then `%s'.\n",
 	       platform::getDefaultClusterFilePath().c_str());
+	printf(
+	    "  -t, --tagname TAGNAME\n"
+	    "                 For start, modify, status, abort, wait, and discontinue operations, the tag of the backup to "
+	    "act on.\n"
+	    "                 Backups on different tags run independently.  Defaults to `default'.  Use `tags' to list all "
+	    "tags.\n");
 	printf("  -d, --destcontainer URL\n"
 	       "                 The Backup container URL for start, modify, describe, query, expire, and delete "
 	       "operations.\n");
@@ -932,7 +938,6 @@ static void printBackupUsage(bool devhelp) {
 	       "                 Specifies a UID to verify against the BackupUID of the running backup.  If provided, the "
 	       "UID is verified in the same transaction\n"
 	       "                 which sets the new backup parameters (if the UID matches).\n");
-	printf("  -e ERRORLIMIT  The maximum number of errors printed by status (default is 10).\n");
 	printf("  -k KEYS        List of key ranges to backup or to filter the backup in query operations.\n"
 	       "                 If not specified, the entire database will be backed up or no filter will be applied.\n");
 	printf("  --keys-file FILE\n"
@@ -952,7 +957,7 @@ static void printBackupUsage(bool devhelp) {
 	printf("  --trace-format FORMAT\n"
 	       "                 Select the format of the trace files. xml (the default) and json are supported.\n"
 	       "                 Has no effect unless --log is specified.\n");
-	printf("  --max-cleanup-seconds SECONDS\n"
+	printf("  --min-cleanup-seconds SECONDS\n"
 	       "                 Specifies the amount of time a backup or DR needs to be stale before cleanup will\n"
 	       "                 remove mutations for it. By default this is set to one hour.\n");
 	printf("  --delete-data\n"
@@ -1011,6 +1016,9 @@ static void printRestoreUsage(bool devhelp) {
 	printf("                 The cluster file to restore data into.\n");
 	printf("  -t, --tagname TAGNAME\n");
 	printf("                 The restore tag to act on.  Default is 'default'\n");
+	printf("\n");
+	printf("  Options for status:\n\n");
+	printf("  --json         Emit the status as a JSON document.\n");
 	printf("\n");
 	printf("  Options for start:\n\n");
 	printf("  -r URL         The Backup URL for the restore to read from.\n");
@@ -1141,7 +1149,9 @@ static void printDBBackupUsage(bool devhelp) {
 	printf("  -s, --source CONNFILE\n"
 	       "                 The path of a file containing the connection string for the\n"
 	       "                 source FoundationDB cluster.\n");
-	printf("  -e ERRORLIMIT  The maximum number of errors printed by status (default is 10).\n");
+	printf("  -e ERRORLIMIT  The maximum number of errors printed by status (default is 20).\n");
+	printf("  --json         Emit status as a JSON document. Reports every error\n"
+	       "                 rather than the -e maximum, which applies to the text output only.\n");
 	printf("  -k KEYS        List of key ranges to backup.\n"
 	       "                 If not specified, the entire database will be backed up.\n");
 	printf("  --keys-file FILE\n"
@@ -1429,6 +1439,7 @@ AsyncResult<std::string> getLayerStatus(Reference<ReadYourWritesTransaction> tr,
 		std::vector<Future<Reference<IBackupContainer>>> tagContainers;
 		std::vector<Future<int64_t>> tagRangeBytes;
 		std::vector<Future<int64_t>> tagLogBytes;
+		std::vector<Future<MutationLogType>> tagMutationLogTypes;
 		Future<Optional<Value>> fBackupPaused = tr->get(fba.taskBucket->getPauseKey(), snapshot);
 
 		tr->setOption(FDBTransactionOptions::ACCESS_SYSTEM_KEYS);
@@ -1443,12 +1454,14 @@ AsyncResult<std::string> getLayerStatus(Reference<ReadYourWritesTransaction> tr,
 			tagStates.push_back(config.stateEnum().getOrThrow(tr, snapshot));
 			tagRangeBytes.push_back(config.rangeBytesWritten().getD(tr, snapshot, 0));
 			tagLogBytes.push_back(config.logBytesWritten().getD(tr, snapshot, 0));
+			tagMutationLogTypes.push_back(config.mutationLogType().getD(tr, snapshot, MutationLogType::DEFAULT));
 			tagContainers.push_back(config.backupContainer().getOrThrow(tr, snapshot));
 			tagLastRestorableVersions.push_back(fba.getLastRestorable(tr, StringRef(tag->tagName), snapshot));
 		}
 
 		co_await (waitForAll(tagLastRestorableVersions) && waitForAll(tagStates) && waitForAll(tagContainers) &&
-		          waitForAll(tagRangeBytes) && waitForAll(tagLogBytes) && success(fBackupPaused));
+		          waitForAll(tagRangeBytes) && waitForAll(tagLogBytes) && waitForAll(tagMutationLogTypes) &&
+		          success(fBackupPaused));
 
 		std::vector<Future<Void>> encryptionSetupResults;
 		std::vector<int> encryptionContainerIndices;
@@ -1503,6 +1516,7 @@ AsyncResult<std::string> getLayerStatus(Reference<ReadYourWritesTransaction> tr,
 			tagRoot.create("running_backup_is_restorable") = (status == EBackupState::STATE_RUNNING_DIFFERENTIAL);
 			tagRoot.create("range_bytes_written") = tagRangeBytes[j].get();
 			tagRoot.create("mutation_log_bytes_written") = tagLogBytes[j].get();
+			tagRoot.create("mutation_log_type") = mutationLogTypeToString(tagMutationLogTypes[j].get());
 			tagRoot.create("mutation_stream_id") = backupTagUids[j].toString();
 			tagRoot.create("file_level_encryption") =
 			    tagContainers[j].get()->getEncryptionKeyFileName().present() ? true : false;
@@ -1513,7 +1527,7 @@ AsyncResult<std::string> getLayerStatus(Reference<ReadYourWritesTransaction> tr,
 		}
 	} else if (exe == ProgramExe::DR_AGENT) {
 		DatabaseBackupAgent dba;
-		Reference<ReadYourWritesTransaction> tr2(new ReadYourWritesTransaction(dest));
+		auto tr2 = makeReference<ReadYourWritesTransaction>(dest);
 		tr2->setOption(FDBTransactionOptions::ACCESS_SYSTEM_KEYS);
 		tr2->setOption(FDBTransactionOptions::LOCK_AWARE);
 		RangeResult tagNames = co_await tr2->getRange(dba.tagNames.range(), 10000, snapshot);
@@ -1676,7 +1690,7 @@ Future<Void> statusUpdateActor(Database statusUpdateDest,
 	std::string metaKey = layerStatusMetaPrefixRange.begin.toString() + "json/" + name;
 	std::string rootKey = backupStatusPrefixRange.begin.toString() + name + "/json";
 	std::string instanceKey = rootKey + "/" + "agent-" + id;
-	Reference<ReadYourWritesTransaction> tr(new ReadYourWritesTransaction(statusUpdateDest));
+	auto tr = makeReference<ReadYourWritesTransaction>(statusUpdateDest);
 	Future<Void> pollRateUpdater;
 
 	// In order to report a useful networkAddress to the cluster's layer status JSON object, determine which local
@@ -2003,11 +2017,12 @@ Future<Void> switchDBBackup(Database src,
 	}
 }
 
-Future<Void> statusDBBackup(Database src, Database dest, std::string tagName, int errorLimit) {
+Future<Void> statusDBBackup(Database src, Database dest, std::string tagName, int errorLimit, bool json) {
 	try {
 		DatabaseBackupAgent backupAgent(src);
 
-		std::string statusText = co_await backupAgent.getStatus(dest, errorLimit, StringRef(tagName));
+		std::string statusText = co_await (json ? backupAgent.getStatusJSON(dest, StringRef(tagName))
+		                                        : backupAgent.getStatus(dest, errorLimit, StringRef(tagName)));
 		printf("%s\n", statusText.c_str());
 	} catch (Error& e) {
 		if (e.code() == error_code_actor_cancelled)
@@ -2232,6 +2247,19 @@ Future<Void> runRestore(Database db,
                         RestoreMode restoreMode = RestoreMode::RANGEFILE) {
 	ASSERT(!ranges.empty());
 
+	// Before anything remote is touched, and here so --dryrun refuses too.
+	if (auto refusal = FileBackupAgent::bulkLoadRestoreRefusal(KeyRef(tagName),
+	                                                           ranges,
+	                                                           KeyRef(addPrefix),
+	                                                           KeyRef(removePrefix),
+	                                                           onlyApplyMutationLogs,
+	                                                           encryptionKeyFile,
+	                                                           restoreMode == RestoreMode::RANGEFILE);
+	    refusal.present()) {
+		fprintf(stderr, "ERROR: %s\n", refusal.get().c_str());
+		throw restore_error();
+	}
+
 	if (targetVersion != invalidVersion && !targetTimestamp.empty()) {
 		fprintf(stderr, "Restore target version and target timestamp cannot both be specified\n");
 		throw restore_error();
@@ -2268,7 +2296,7 @@ Future<Void> runRestore(Database db,
 		Reference<IBackupContainer> bc = openBackupContainer(
 		    exeRestore.toString().c_str(), container, proxy, encryptionKeyFile, /*encryptionBlockSize=*/0);
 		// If targetVersion is unset then use the maximum restorable version from the backup description
-		if (targetVersion == invalidVersion) {
+		if (restoreMode == RestoreMode::RANGEFILE && targetVersion == invalidVersion) {
 			if (verbose)
 				printf(
 				    "No restore target version given, will use maximum restorable version from backup description.\n");
@@ -2316,7 +2344,8 @@ Future<Void> runRestore(Database db,
 				fmt::print("Restored to version {}\n", restoredVersion);
 			}
 		} else {
-			Optional<RestorableFileSet> rset = co_await bc->getRestoreSet(targetVersion, ranges);
+			Optional<RestorableFileSet> rset = co_await bc->getRestoreSet(
+			    targetVersion, ranges, false, invalidVersion, restoreMode == RestoreMode::BULKLOAD);
 
 			if (!rset.present()) {
 				fmt::print(stderr,
@@ -2325,7 +2354,7 @@ Future<Void> runRestore(Database db,
 				throw restore_invalid_version();
 			}
 
-			fmt::print("Backup can be used to restore to version {}\n", targetVersion);
+			fmt::print("Backup can be used to restore to version {}\n", rset.get().targetVersion);
 		}
 
 	} catch (Error& e) {
@@ -2528,16 +2557,16 @@ std::pair<Version, Version> getMaxMinRestorableVersions(const BackupDescription&
 // If restoreVersion is invalidVersion or latestVersion, use the maximum or minimum restorable version respectively for
 // selected key ranges. If restoreTimestamp is specified, any specified restoreVersion will be overridden to the version
 // resolved to that timestamp.
-Future<Void> queryBackup(const char* name,
-                         std::string destinationContainer,
-                         Optional<std::string> proxy,
-                         Standalone<VectorRef<KeyRangeRef>> keyRangesFilter,
-                         Version restoreVersion,
-                         Version snapshotVersion,
-                         std::string originalClusterFile,
-                         std::string restoreTimestamp,
-                         Verbose verbose,
-                         Optional<Database> cx) {
+Future<int> queryBackup(const char* name,
+                        std::string destinationContainer,
+                        Optional<std::string> proxy,
+                        Standalone<VectorRef<KeyRangeRef>> keyRangesFilter,
+                        Version restoreVersion,
+                        Version snapshotVersion,
+                        std::string originalClusterFile,
+                        std::string restoreTimestamp,
+                        Verbose verbose,
+                        Optional<Database> cx) {
 	UID operationId = deterministicRandom()->randomUniqueID();
 	JsonBuilderObject result;
 	std::string errorMessage;
@@ -2553,37 +2582,38 @@ Future<Void> queryBackup(const char* name,
 	    .detail("RestoreTimestamp", restoreTimestamp)
 	    .detail("BackupClusterFile", originalClusterFile);
 
-	// Resolve restoreTimestamp if given
-	if (!restoreTimestamp.empty()) {
-		if (originalClusterFile.empty()) {
-			reportBackupQueryError(
-			    operationId,
-			    result,
-			    format("a cluster file must be given in order to resolve restore target timestamp '%s'",
-			           restoreTimestamp.c_str()));
-			co_return;
-		}
-
-		if (!fileExists(originalClusterFile)) {
-			reportBackupQueryError(operationId,
-			                       result,
-			                       format("The specified original source database cluster file '%s' does not exist\n",
-			                              originalClusterFile.c_str()));
-			co_return;
-		}
-
-		Database origDb = Database::createDatabase(originalClusterFile, ApiVersion::LATEST_VERSION);
-		Version v = co_await timeKeeperVersionFromDatetime(restoreTimestamp, origDb);
-		result["restore_timestamp"] = restoreTimestamp;
-		result["restore_timestamp_resolved_version"] = v;
-		restoreVersion = v;
-	}
-
 	int64_t totalRangeFilesSize = 0;
 	int64_t totalLogFilesSize = 0;
 	JsonBuilderArray rangeFilesJson;
 	JsonBuilderArray logFilesJson;
 	try {
+		// Resolve restoreTimestamp if given
+		if (!restoreTimestamp.empty()) {
+			if (originalClusterFile.empty()) {
+				reportBackupQueryError(
+				    operationId,
+				    result,
+				    format("a cluster file must be given in order to resolve restore target timestamp '%s'",
+				           restoreTimestamp.c_str()));
+				co_return FDB_EXIT_ERROR;
+			}
+
+			if (!fileExists(originalClusterFile)) {
+				reportBackupQueryError(
+				    operationId,
+				    result,
+				    format("The specified original source database cluster file '%s' does not exist\n",
+				           originalClusterFile.c_str()));
+				co_return FDB_EXIT_ERROR;
+			}
+
+			Database origDb = Database::createDatabase(originalClusterFile, ApiVersion::LATEST_VERSION);
+			Version v = co_await timeKeeperVersionFromDatetime(restoreTimestamp, origDb);
+			result["restore_timestamp"] = restoreTimestamp;
+			result["restore_timestamp_resolved_version"] = v;
+			restoreVersion = v;
+		}
+
 		Reference<IBackupContainer> bc = openBackupContainer(name, destinationContainer, proxy, {}, 0);
 		BackupDescription desc = co_await bc->describeBackup();
 		// Use continuous log end version for the maximum restorable version for the key ranges when a restorable
@@ -2606,7 +2636,7 @@ Future<Void> queryBackup(const char* name,
 			                       result,
 			                       errorMessage =
 			                           format("the specified restorable version %lld is not valid", restoreVersion));
-			co_return;
+			co_return FDB_EXIT_ERROR;
 		}
 
 		Optional<RestorableFileSet> fileSet;
@@ -2654,11 +2684,11 @@ Future<Void> queryBackup(const char* name,
 				    result,
 				    format("no restorable files set found for specified key ranges from snapshotVersion %lld",
 				           snapshotVersion));
-				co_return;
+				co_return FDB_EXIT_ERROR;
 			}
 
 			// We only need to know all the mutation logs from `snapshotVersion` to `restoreVersion`.
-			fileSet = co_await bc->getRestoreSet(restoreVersion, keyRangesFilter, /*logOnly=*/true, snapshotVersion);
+			fileSet = co_await bc->getRestoreSet(restoreVersion, keyRangesFilter, /*logsOnly=*/true, snapshotVersion);
 		} else {
 			// When a snapshot version is not specified, we use the latest snapshot to restore to the `restoreVersion`.
 			fileSet = co_await bc->getRestoreSet(restoreVersion, keyRangesFilter);
@@ -2697,12 +2727,12 @@ Future<Void> queryBackup(const char* name,
 			    .detail("LogFilesBytes", totalLogFilesSize);
 		} else if (snapshotVersion == invalidVersion) {
 			reportBackupQueryError(operationId, result, "no restorable files set found for specified key ranges");
-			co_return;
+			co_return FDB_EXIT_ERROR;
 		}
 
 	} catch (Error& e) {
 		reportBackupQueryError(operationId, result, e.what());
-		co_return;
+		co_return FDB_EXIT_ERROR;
 	}
 
 	result["total_range_files_size"] = totalRangeFilesSize;
@@ -2714,6 +2744,7 @@ Future<Void> queryBackup(const char* name,
 	}
 
 	printf("%s\n", result.getJson().c_str());
+	co_return FDB_EXIT_SUCCESS;
 }
 
 Future<Void> listBackup(std::string baseUrl, Optional<std::string> proxy) {
@@ -2771,7 +2802,7 @@ Future<Void> modifyBackup(Database db, std::string tagName, BackupModifyOptions 
 
 	KeyBackedTag tag = makeBackupTag(tagName);
 
-	Reference<ReadYourWritesTransaction> tr(new ReadYourWritesTransaction(db));
+	auto tr = makeReference<ReadYourWritesTransaction>(db);
 	while (true) {
 		Error err;
 		try {
@@ -4278,16 +4309,16 @@ int main(int argc, char* argv[]) {
 
 			case BackupType::QUERY:
 				initTraceFile();
-				f = stopAfter(queryBackup(newArgV[0],
-				                          destinationContainer,
-				                          proxy,
-				                          backupKeysFilter,
-				                          restoreVersion,
-				                          snapshotVersion,
-				                          clusterFile,
-				                          restoreTimestamp,
-				                          Verbose{ !quietDisplay },
-				                          db));
+				fstatus = stopAfter(queryBackup(newArgV[0],
+				                                destinationContainer,
+				                                proxy,
+				                                backupKeysFilter,
+				                                restoreVersion,
+				                                snapshotVersion,
+				                                clusterFile,
+				                                restoreTimestamp,
+				                                Verbose{ !quietDisplay },
+				                                db));
 				break;
 
 			case BackupType::DUMP:
@@ -4374,10 +4405,12 @@ int main(int argc, char* argv[]) {
 				// If no tag is specifically provided then print all tag status, don't just use "default"
 				if (tagProvided)
 					tag = tagName;
-				f = stopAfter(map(ba.restoreStatus(db, KeyRef(tag)), [](std::string s) -> Void {
-					printf("%s\n", s.c_str());
-					return Void();
-				}));
+				f = stopAfter(
+				    map(jsonOutput ? ba.restoreStatusJSON(db, KeyRef(tag)) : ba.restoreStatus(db, KeyRef(tag)),
+				        [](std::string s) -> Void {
+					        printf("%s\n", s.c_str());
+					        return Void();
+				        }));
 				break;
 			default:
 				throw restore_error();
@@ -4398,7 +4431,7 @@ int main(int argc, char* argv[]) {
 				f = stopAfter(submitDBBackup(sourceDb, db, backupKeys, tagName));
 				break;
 			case DBType::STATUS:
-				f = stopAfter(statusDBBackup(sourceDb, db, tagName, maxErrors));
+				f = stopAfter(statusDBBackup(sourceDb, db, tagName, maxErrors, jsonOutput));
 				break;
 			case DBType::SWITCH:
 				f = stopAfter(switchDBBackup(sourceDb, db, backupKeys, tagName, forceAction));
@@ -4431,8 +4464,8 @@ int main(int argc, char* argv[]) {
 			status = FDB_EXIT_ERROR;
 		}
 
-		if (fstatus.isValid() && fstatus.isReady() && !fstatus.isError() && fstatus.get().present()) {
-			status = fstatus.get().get();
+		if (fstatus.isValid() && fstatus.isReady() && !fstatus.isError()) {
+			status = fstatus.get().orDefault(FDB_EXIT_ERROR);
 		}
 
 #ifdef ALLOC_INSTRUMENTATION
@@ -4526,6 +4559,7 @@ int main() {
 		int argc = static_cast<int>(persistentArgs.size());
 
 		std::vector<char*> argv;
+		argv.reserve(persistentArgs.size() + 1);
 		for (auto& arg : persistentArgs) {
 			argv.push_back(arg.data());
 		}

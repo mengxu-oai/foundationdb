@@ -68,6 +68,9 @@
  */
 class BackupContainerFileSystem : public IBackupContainer {
 public:
+	static Future<std::vector<BulkDumpRangeVersion>> readBulkDumpRanges(Reference<IBackupContainer> container,
+	                                                                    std::string jobId);
+
 	void addref() override = 0;
 	void delref() override = 0;
 
@@ -120,7 +123,7 @@ public:
 	                                              Version fileVersion,
 	                                              int blockSize) override;
 
-	Future<std::pair<std::vector<RangeFile>, std::map<std::string, KeyRange>>> readKeyspaceSnapshot(
+	AsyncResult<std::pair<std::vector<RangeFile>, std::map<std::string, KeyRange>>> readKeyspaceSnapshot(
 	    KeyspaceSnapshotFile snapshot);
 
 	Future<Void> writeKeyspaceSnapshotFile(const std::vector<std::string>& fileNames,
@@ -165,7 +168,8 @@ public:
 	Future<Optional<RestorableFileSet>> getRestoreSet(Version targetVersion,
 	                                                  VectorRef<KeyRangeRef> keyRangesFilter,
 	                                                  bool logsOnly,
-	                                                  Version beginVersion) final;
+	                                                  Version beginVersion,
+	                                                  bool useBulkDump = false) final;
 	static Future<Void> createTestEncryptionKeyFile(std::string const& filename);
 
 	Future<Void> writeEncryptionMetadata(int encryptionBlockSize) override;
