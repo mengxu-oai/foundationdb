@@ -27,7 +27,7 @@
 #include "flow/genericactors.h"
 
 #include "fdbclient/FDBTypes.h"
-#include "fdbclient/NativeAPI.actor.h"
+#include "fdbclient/NativeAPI.h"
 #include "fdbclient/RunRYWTransaction.h"
 #include "fdbclient/Subspace.h"
 #include "fdbclient/KeyBackedTypes.h"
@@ -213,6 +213,19 @@ public:
 	Future<Void> finish(Reference<ReadYourWritesTransaction> tr, Reference<Task> task);
 	Future<Void> finish(Database cx, Reference<Task> task) {
 		return runRYWTransaction(cx, [=](Reference<ReadYourWritesTransaction> tr) { return finish(tr, task); });
+	}
+
+	// Update a persisted parameter without moving the lease key. Hold task->extendMutex through commit
+	// so the ownership check and write address the same lease.
+	Future<Void> updateTaskParam(Reference<ReadYourWritesTransaction> tr,
+	                             Reference<Task> task,
+	                             Key param,
+	                             Value value) {
+		Key paramKey = timeouts.get(task->timeoutVersion).get(task->key).pack(param);
+		return map(keepRunning(tr, task), [=](Void) {
+			tr->set(paramKey, value);
+			return Void();
+		});
 	}
 
 	// Extend the task's timeout as if it just started and also save any parameter changes made to the task
@@ -446,9 +459,7 @@ struct TaskFuncBase : IDispatched<TaskFuncBase, Standalone<StringRef>, std::func
 		return Reference<TaskFuncBase>(dispatch(taskFuncType)());
 	}
 
-	static bool isValidTaskType(StringRef type) {
-		return !type.empty() && (dispatches().find(type) != dispatches().end());
-	}
+	static bool isValidTaskType(StringRef type) { return !type.empty() && dispatches().contains(type); }
 
 	static bool isValidTask(Reference<Task> task) {
 		auto itor = task->params.find(Task::reservedTaskParamKeyType);

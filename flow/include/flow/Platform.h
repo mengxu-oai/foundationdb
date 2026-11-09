@@ -395,6 +395,11 @@ std::string joinPath(std::string const& directory, std::string const& filename);
 // Relative paths remain relative and are NOT rebased on the current working directory.
 std::string cleanPath(std::string const& path);
 
+// Returns true if `path`, when joined onto a base directory, can only resolve to the base itself or something
+// within it. The check is purely lexical, so it does not account for symbolic links inside the base.  An empty path
+// is contained, as is "."; any ".." component is rejected, even one that stays within the base.
+bool relativePathIsContained(const std::string& path);
+
 // Removes the last component from a path string (if possible) and returns the result with one trailing separator.
 // If there is only one path component, the result will be "" for relative paths and "/" for absolute paths.
 // Note that this is NOT the same as getting the parent of path, as the final component could be ".."
@@ -897,17 +902,9 @@ EXTERNC void setProfilingEnabled(int enabled);
 	                             DTRACE_PROBE)                                                                         \
 	(foundationdb, __VA_ARGS__)
 
-extern void fdb_probe_actor_create(const char* name, unsigned long id);
-extern void fdb_probe_actor_destroy(const char* name, unsigned long id);
-extern void fdb_probe_actor_enter(const char* name, unsigned long, int index);
-extern void fdb_probe_actor_exit(const char* name, unsigned long, int index);
 #else
 #define FDB_TRACE_PROBE_STRING_CONCAT(h, t) h##t
 #define FDB_TRACE_PROBE(...)
-inline void fdb_probe_actor_create(const char* name, unsigned long id) {}
-inline void fdb_probe_actor_destroy(const char* name, unsigned long id) {}
-inline void fdb_probe_actor_enter(const char* name, unsigned long id, int index) {}
-inline void fdb_probe_actor_exit(const char* name, unsigned long id, int index) {}
 #endif
 
 #if defined(__aarch64__)

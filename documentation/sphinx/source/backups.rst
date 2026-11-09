@@ -88,7 +88,7 @@ For blob store backup locations, the Backup URL format is
 
 ::
 
-    blobstore://[<api_key>][:<secret>[:<security_token>]]@<hostname>[:<port>]/<name>?bucket=<bucket_name>[&region=<region_name>][&<param>=<value>]...]
+    blobstore://[<api_key>][:<secret>[:<security_token>]]@<hostname>[:<port>]/<name>?bucket=<bucket_name>[&prefix=<key_prefix>][&region=<region_name>][&<param>=<value>]...]
 
       <api_key>         API key to use for authentication. If S3, it is AWS_ACCESS_KEY_ID. Optional.
       <secret>          API key's secret.  If S3, it is AWS_SECRET_ACCESS_KEY. Optional.
@@ -97,10 +97,15 @@ For blob store backup locations, the Backup URL format is
       <port>            Remote port to connect to.  Optional.  Default is 80.
       <name>            Name of the backup within the backup bucket.  It can contain '/' characters in order to organize backups into a folder-like structure.
       <bucket_name>     Name of the bucket to use for backup data.
+      <key_prefix>      Optional object key prefix.  When present, the backup's object key trees ('data/' and 'backups/') are placed under this prefix in the bucket instead of the bucket root.  Each path segment may contain only ASCII alphanumerics, '_', '-' and '.'; '/' separates segments.  Leading and trailing '/' are ignored, while empty, '.' and '..' path segments and the reserved first segments 'data' and 'backups' are rejected.  A value containing only '/' characters is normalized to an empty prefix and uses the existing bucket-root layout.
       <region_name>     If <hostname> is not in s3 compatible form (s3.region-name.example.com) and aws v4 signature is enabled, region name is required.
       <param>=<value>   Optional URL parameters.  See below for details.
 
 A single bucket (specified by <bucket_name>) can hold any number of backups, each with a different <name>.
+
+By default backup objects are written under two top-level folders in the bucket: backup data under ``data/<name>/...`` and an index entry under ``backups/<name>``.  When the bucket is shared with other applications or tenants this can be undesirable, for example when IAM policies, replication rules or lifecycle rules are scoped to a key prefix.  Specifying ``prefix=<key_prefix>`` places both trees under the given prefix instead (``<key_prefix>/data/<name>/...`` and ``<key_prefix>/backups/<name>``), so all objects of the backup live under a single configurable prefix.  Backups whose resulting object key trees do not overlap are independent namespaces: ``fdbbackup list`` with a ``prefix`` parameter in the base URL enumerates only the backups under that prefix.  All tools must use the same ``prefix`` parameter to operate on a backup that was created with one.  Note that versions of the client tools and backup agents that predate this parameter reject URLs containing it, so upgrade all agents before using it.
+
+The backup URL is not a security boundary.  The ``prefix`` value is used byte-for-byte after stripping leading and trailing slashes; percent-encoding is not decoded, and characters within each segment are limited to ``[A-Za-z0-9._-]``.  The normalized first segment cannot be ``data`` or ``backups``.  Within one bucket, other combinations of ``<key_prefix>`` and ``<name>`` whose resulting object key trees overlap (for example ``prefix=tenant`` with ``name=data/foo`` and ``prefix=tenant/data`` with ``name=foo``) must be avoided, or the result is undefined.
 
 If <secret> is not specified on the URL, it will be looked up in :ref:`blob credential sources<blob-credential-files>`.
 
@@ -283,7 +288,7 @@ The following options apply to most subcommands:
 ``start``
 ---------
 
-The ``start`` subcommand is used to start a backup.  If there is already a backup in progress, the command will fail and the current backup will be unaffected.  Otherwise, a backup is started. If the wait option is used, the command will wait for the backup to complete; otherwise, it returns immediately.
+The ``start`` subcommand is used to start a backup.  If there is already a backup in progress on the tag, or a backup on another tag is running at the same location (for a blob store URL, the same host, port, bucket, prefix, and backup name, regardless of credentials and other URL parameters), the command will fail and the current backup will be unaffected.  Otherwise, a backup is started. If the wait option is used, the command will wait for the backup to complete; otherwise, it returns immediately.
 
 ::
 
@@ -324,7 +329,7 @@ The ``modify`` subcommand is used to modify parameters of a running backup.  All
    user@host$ fdbbackup modify [-t <TAG>] [-d <BACKUP_URL>] [-s <DURATION>] [--active-snapshot-interval <DURATION>] [--verify-uid <UID>]
 
 ``-d <BACKUP_URL>``
-  Sets a new Backup URL for the backup to write to.  This is most likely to be used to change only URL parameters or account information.  However, it can also be used to start writing to a new destination mid-backup.  The new old location will cease gaining any additional restorability, while the new location will not be restorable until a new snapshot begins and completes.  Full restorability would be regained, however, if the contents of the two destinations were to be combined by the user.
+  Sets a new Backup URL for the backup to write to.  This is most likely to be used to change only URL parameters or account information.  However, it can also be used to start writing to a new destination mid-backup.  The new old location will cease gaining any additional restorability, while the new location will not be restorable until a new snapshot begins and completes.  Full restorability would be regained, however, if the contents of the two destinations were to be combined by the user.  The new location cannot be one that a backup on another tag is running at.
 
 ``-s <DURATION>`` or ``--snapshot-interval <DURATION>``  
   Sets a new duration for backup snapshots, in seconds.
