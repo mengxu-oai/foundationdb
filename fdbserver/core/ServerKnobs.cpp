@@ -1113,6 +1113,7 @@ void ServerKnobs::initialize(Randomize randomize, ClientKnobs* clientKnobs, IsSi
 	init( REFERENCE_SPILL_UPDATE_STORAGE_BYTE_LIMIT,            20e6 ); if( (randomize && buggify()) || smallTlogTarget ) REFERENCE_SPILL_UPDATE_STORAGE_BYTE_LIMIT = 1e6;
 	init( TLOG_HARD_LIMIT_BYTES,                              3000e6 ); if( smallTlogTarget ) TLOG_HARD_LIMIT_BYTES = 30e6;
 	init( TLOG_MIN_AVAILABLE_SPACE_RATIO,                        0.0 ); if( randomize && buggify() ) TLOG_MIN_AVAILABLE_SPACE_RATIO = 0.1;
+	init( TLOG_DISK_SPACE_CHECK_INTERVAL,                        1.0 ); if( randomize && buggify() ) TLOG_DISK_SPACE_CHECK_INTERVAL = deterministicRandom()->coinflip() ? 0.0 : deterministicRandom()->random01();
 	init( TLOG_RECOVER_MEMORY_LIMIT, TARGET_BYTES_PER_TLOG + SPRING_BYTES_TLOG );
 
 	init( MAX_TRANSACTIONS_PER_BYTE,                            1000 );
@@ -1296,6 +1297,8 @@ void ServerKnobs::initialize(Randomize randomize, ClientKnobs* clientKnobs, IsSi
 	init( STORAGESERVER_READ_PRIORITIES,           "120,10,20,40,60" );
 	// The total concurrency which will be shared by active priorities according to their relative weights
 	init( STORAGE_SERVER_READ_CONCURRENCY,                        70 );
+	// Emergency: if non-zero, drop (instead of asserting on) mutations delivered to a not-assigned shard at exactly this version
+	init( SS_SKIP_DELIVERED_TO_NOT_ASSIGNED_VERSION,               0 );
 	// The priority number which each ReadType maps to in enumeration order
 	// This exists for flexibility but assigning each ReadType to its own unique priority number makes the most sense
 	// The enumeration is currently: eager, fetch, low, normal, high
