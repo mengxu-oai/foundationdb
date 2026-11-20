@@ -4,7 +4,7 @@ storageEngineExcludeTypes = ["ssd-sharded-rocksdb"] #FIXME: remove after allowin
 disableTss = true # TODO(BulkLoad): support TSS. finishMoveShard should wait for TSS if a data move is bulkload data move.
 
 # DD's bulk-load team selection rejects any team that shares a server with the source team
-# (DDTeamCollection.actor.cpp:266-282). Pin redundancy to 'triple' (matching
+# (DDTeamCollection.cpp:268-284). Pin redundancy to 'triple' (matching
 # PhysicalShardMove and StorageServerCheckpointRestore which exercise similar bulk-load
 # paths) so the simulator cannot pick three_data_hall or other modes whose tighter
 # topology constraints leave team selection with no disjoint candidate team -- the
@@ -74,3 +74,17 @@ waitForQuiescence = false
     # transaction can't commit in time and start() fails with timed_out. Raise the cap well
     # above worst-case recovery; the submit still retries underneath.
     jobSubmitTimeout = 600.0
+
+# Bulkload ingests files without committing mutations, so a backup running over the range would record the clear
+# before the load but never the loaded data: the two must exclude each other.
+[[test]]
+testTitle = 'BulkLoadBackupGuard'
+simBackupAgents = 'BackupToFile'
+useDB = true
+waitForQuiescence = false
+
+    [[test.workload]]
+    testName = 'BulkDumpingWorkload'
+    bulkLoadTransportMethod = 1
+    jobSubmitTimeout = 600.0
+    checkBackupGuard = true

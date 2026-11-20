@@ -153,7 +153,7 @@ class DDTeamCollectionImpl {
 					start = now();
 				}
 			} catch (Error& e) {
-				TraceEvent("CheckAndRemoveInvalidLocalityAddrRetry", self->distributorId).detail("Error", e.what());
+				TraceEvent("CheckAndRemoveInvalidLocalityAddrRetry", self->distributorId).error(e);
 			}
 		}
 	}
@@ -1015,6 +1015,9 @@ public:
 		bool lastZeroHealthy = self->zeroHealthyTeams->get();
 		bool firstCheck = true;
 		bool firstHealthChangeTrace = true;
+		bool lastProcessingUnhealthy = self->processingUnhealthy->get();
+		bool retryDue = false;
+		Future<Void> retryTimer;
 		std::unordered_set<KeyRange> submittedShards;
 
 		Future<Void> zeroServerLeftLogger;
@@ -1083,14 +1086,23 @@ public:
 				    !healthy && self->shardsAffectedByTeamFailure->hasShards(
 				                    ShardsAffectedByTeamFailure::Team(team->getServerIDs(), self->primary));
 				if (retryUnhealthyShards) {
+					if (!retryTimer.isValid()) {
+						retryTimer = delay(checkTeamDelay, TaskPriority::DataDistributionLow);
+					} else if (retryTimer.isReady()) {
+						retryDue = true;
+						retryTimer = delay(checkTeamDelay, TaskPriority::DataDistributionLow);
+					}
 					change.push_back(self->processingUnhealthy->onChange());
 					change.push_back(self->pipelineFull->onChange());
-					// Partial moves can leave a merged shard associated with this team without another health change.
-					change.push_back(delay(checkTeamDelay, TaskPriority::DataDistributionLow));
+				} else {
+					retryTimer = Future<Void>();
+					retryDue = false;
 				}
 				const bool healthyTeamBecameAvailable = lastZeroHealthy && !self->zeroHealthyTeams->get();
 				const bool processingUnhealthy = self->processingUnhealthy->get();
 				const bool pipelineFull = self->pipelineFull->get();
+				const bool unhealthyDrained = lastProcessingUnhealthy && !processingUnhealthy;
+				lastProcessingUnhealthy = processingUnhealthy;
 				bool recheck = !healthy && (lastReady != self->initialFailureReactionDelay.isReady() ||
 				                            healthyTeamBecameAvailable || containsFailed || retryUnhealthyShards);
 				bool teamStateChanged = serversLeft != lastServersLeft || anyUndesired != lastAnyUndesired ||
@@ -1257,10 +1269,15 @@ public:
 						std::vector<KeyRange> shards = self->shardsAffectedByTeamFailure->getShardsFor(
 						    ShardsAffectedByTeamFailure::Team(team->getServerIDs(), self->primary));
 						if (teamStateChanged || !retryUnhealthyShards || healthyTeamBecameAvailable ||
-						    (!processingUnhealthy && !pipelineFull)) {
+						    unhealthyDrained || (retryDue && !processingUnhealthy && !pipelineFull)) {
 							// Undesired and explicitly failed relocations do not set processingUnhealthy. Keep
-							// retrying stranded ranges when the queue is idle and its pipeline can accept them.
+							// retrying stranded ranges at the polling interval when the queue can accept them.
+							// A transient pipeline-full edge must not clear the dedupe set and resubmit all ranges.
 							submittedShards.clear();
+							retryDue = false;
+							if (retryUnhealthyShards) {
+								retryTimer = delay(checkTeamDelay, TaskPriority::DataDistributionLow);
+							}
 						} else {
 							// An unchanged range may still be waiting behind the relocation pipeline gate. Only retry
 							// newly mapped ranges while unhealthy relocations remain in the queue, and forget ranges
@@ -1370,6 +1387,10 @@ public:
 					}
 				}
 
+				if (retryUnhealthyShards) {
+					// Partial moves can leave a merged shard associated with this team without another health change.
+					change.push_back(retryTimer);
+				}
 				// Wait for any of the machines to change status
 				co_await quorum(change, 1);
 				co_await yield();
@@ -2328,7 +2349,7 @@ public:
 
 		UID nextId = co_await self->getNextWigglingServerID();
 		StorageWiggleValue value(nextId);
-		Reference<ReadYourWritesTransaction> tr(new ReadYourWritesTransaction(self->dbContext()));
+		auto tr = makeReference<ReadYourWritesTransaction>(self->dbContext());
 		while (true) {
 			counters->started->increment(1);
 			// write the next server id
@@ -3049,7 +3070,7 @@ public:
 		PromiseStream<Future<Void>> addTSSInProgress;
 		Future<Void> inProgressTSS =
 		    actorCollection(addTSSInProgress.getFuture(), &inProgressTSSCount, nullptr, nullptr, nullptr);
-		Reference<TSSPairState> tssState = makeReference<TSSPairState>();
+		auto tssState = makeReference<TSSPairState>();
 		Future<Void> checkTss = self->initialFailureReactionDelay;
 		bool pendingTSSCheck = false;
 
@@ -3181,7 +3202,7 @@ public:
 							    .detail("NumExistingSS", numExistingSS);
 						}
 
-						if (hasHealthyTeam && !tssState->active && tssToRecruit > 0) {
+						if (hasHealthyTeam && !tssState->isActive() && tssToRecruit > 0) {
 							TraceEvent("TSS_Recruit", self->distributorId)
 							    .detail("Stage", "HoldTSS")
 							    .detail("Addr", candidateSSAddr.toString())
@@ -3197,7 +3218,7 @@ public:
 							    initializeStorage(self, candidateWorker, ddEnabledState, true, tssState));
 							checkTss = self->initialFailureReactionDelay;
 						} else {
-							if (tssState->active && tssState->inDataZone(candidateWorker.worker.locality)) {
+							if (tssState->isActive() && tssState->inDataZone(candidateWorker.worker.locality)) {
 								CODE_PROBE(true, "TSS recruits pair in same dc/datahall");
 								self->isTssRecruiting = false;
 								TraceEvent("TSS_Recruit", self->distributorId)
@@ -3211,7 +3232,7 @@ public:
 								tssState = makeReference<TSSPairState>();
 							} else {
 								CODE_PROBE(
-								    tssState->active,
+								    tssState->isActive(),
 								    "TSS recruitment skipped potential pair because it's in a different dc/datahall");
 								self->addActor.send(initializeStorage(
 								    self, candidateWorker, ddEnabledState, false, makeReference<TSSPairState>()));
@@ -3299,6 +3320,7 @@ public:
 
 	static Future<Void> updateReplicasKey(DDTeamCollection* self, Optional<Key> dcId) {
 		std::vector<Future<Void>> serverUpdates;
+		serverUpdates.reserve(self->server_info.size());
 
 		for (auto& it : self->server_info) {
 			serverUpdates.push_back(it.second->updated.getFuture());
@@ -3487,13 +3509,14 @@ public:
 			TxnCounters* counters = updateStorageMetadataCounters();
 			KeyBackedObjectMap<UID, StorageMetadataType, decltype(IncludeVersion())> metadataMap(
 			    serverMetadataKeys.begin, IncludeVersion());
-			Reference<ReadYourWritesTransaction> tr = makeReference<ReadYourWritesTransaction>(self->dbContext());
+			auto tr = makeReference<ReadYourWritesTransaction>(self->dbContext());
 
 			bool isTss = server->getLastKnownInterface().isTss();
 			// Update server's storeType, especially when it was created
 			co_await server->updateStoreType();
 			if (server->getStoreType() == KeyValueStoreType::SSD_SHARDED_ROCKSDB &&
-			    !SERVER_KNOBS->SHARD_ENCODE_LOCATION_METADATA) {
+			    !self->configuration.shardMetadataFormatIsEncoded().orDefault(
+			        SERVER_KNOBS->SHARD_ENCODE_LOCATION_METADATA)) {
 				TraceEvent(SevError, "PhysicalShardNotEnabledForShardedRocks", self->getDistributorId())
 				    .detail("StorageServer", server->getId());
 				throw internal_error();
@@ -3614,6 +3637,7 @@ public:
 
 			// The following actors (e.g. storageRecruiter) do not need to be assigned to a variable because
 			// they are always running.
+			self->addActor.send(self->serverEligibilityLogger());
 			self->addActor.send(self->monitorHealthyTeams());
 
 			self->addActor.send(self->storageRecruiter(recruitStorage, *ddEnabledState));
@@ -3667,6 +3691,7 @@ public:
 					    .detail("StorageTeamSize", self->configuration.storageTeamSize)
 					    .detail("ZeroHealthy", self->zeroOptimalTeams.get())
 					    .detail("HighestPriority", highestPriority)
+					    .detail("HighestTeamPriority", self->getHighestTeamPriority())
 					    .trackLatest(self->primary ? "TotalDataInFlight"
 					                               : "TotalDataInFlightRemote"); // This trace event's trackLatest
 					                                                             // lifetime is controlled by
@@ -4040,7 +4065,9 @@ void DDTeamCollection::updateTeamEligibility() {
 			team->resetEligibilityCount(data_distribution::EligibilityCounter::LOW_CPU);
 		}
 	}
+
 	TraceEvent("TeamEligibilityCount", distributorId)
+	    .detail("Primary", primary)
 	    .detail("TotalTeam", teams.size())
 	    .detail("HealthyTeam", healthyCount)
 	    .detail("AllMetricsLowTeam", allMetricsLow)
@@ -4048,6 +4075,78 @@ void DDTeamCollection::updateTeamEligibility() {
 	    .detail("LowCPUTeam", lowCpuTotal)
 	    .detail("PivotAvailableSpaceRatio", teamPivots.pivotAvailableSpaceRatio)
 	    .detail("PivotCpuRatio", teamPivots.pivotCPU);
+
+	lastEligibilitySurvey = now();
+}
+
+Future<Void> DDTeamCollection::serverEligibilityLogger() {
+	while (true) {
+		// Body before the delay, so a new collection -- every distributor restart -- reports at once.
+		traceServerEligibility();
+		co_await delay(SERVER_KNOBS->DD_SERVER_ELIGIBILITY_LOGGING_INTERVAL, TaskPriority::FlushTrace);
+	}
+}
+
+// Per-server counterpart to TeamEligibilityCount. Reuses the counters the last survey left behind, so
+// the figures can be up to DD_TEAM_PIVOT_UPDATE_DELAY stale; SurveyAgeSeconds reports that, and -1 says
+// no survey has run and the eligibility figures are unknown rather than zero.
+void DDTeamCollection::traceServerEligibility() const {
+	const bool surveyed = lastEligibilitySurvey.present();
+
+	const int targetTeamsPerServer = (SERVER_KNOBS->DESIRED_TEAMS_PER_SERVER * (configuration.storageTeamSize + 1)) / 2;
+	int healthyServers = 0, serversWithoutEligibleTeam = 0, serversWithMetrics = 0;
+	int serversBelowTeamTarget = 0, minTeamsPerServer = std::numeric_limits<int>::max();
+	double minFreeRatio = 1.0, maxFreeRatio = 0.0;
+
+	for (auto const& [serverId, server] : server_info) {
+		if (server_status.get(serverId).isUnhealthy()) {
+			continue;
+		}
+		++healthyServers;
+
+		if (surveyed) {
+			bool anyEligible = false;
+			for (auto const& team : server->getTeams()) {
+				if (team->getEligibilityCount(data_distribution::EligibilityCounter::LOW_DISK_UTIL) > 0) {
+					anyEligible = true;
+					break;
+				}
+			}
+			if (!anyEligible) {
+				++serversWithoutEligibleTeam;
+			}
+		}
+
+		const int serverTeams = server->getTeams().size();
+		if (serverTeams < targetTeamsPerServer) {
+			++serversBelowTeamTarget;
+		}
+		minTeamsPerServer = std::min(minTeamsPerServer, serverTeams);
+
+		if (server->metricsPresent()) {
+			auto [available, capacity] = server->spaceBytes();
+			if (capacity > 0) {
+				double freeRatio = std::max(0.0, (double)available / capacity);
+				minFreeRatio = std::min(minFreeRatio, freeRatio);
+				maxFreeRatio = std::max(maxFreeRatio, freeRatio);
+				++serversWithMetrics;
+			}
+		}
+	}
+
+	TraceEvent("DDServerEligibility", distributorId)
+	    .detail("Primary", primary)
+	    .detail("HealthyServers", healthyServers)
+	    .detail("ServersWithoutEligibleTeam", surveyed ? serversWithoutEligibleTeam : -1)
+	    .detail("SurveyAgeSeconds", surveyed ? now() - lastEligibilitySurvey.get() : -1.0)
+	    .detail("ServersBelowTeamTarget", serversBelowTeamTarget)
+	    .detail("TargetTeamsPerServer", targetTeamsPerServer)
+	    .detail("MinTeamsPerServer", healthyServers ? minTeamsPerServer : -1)
+	    .detail("LastBuildTeamsFailed", lastBuildTeamsFailed)
+	    .detail("TotalTeams", teams.size())
+	    .detail("MachineTeams", machineTeams.size())
+	    .detail("MinServerFreeRatio", serversWithMetrics ? minFreeRatio : -1.0)
+	    .detail("MaxServerFreeRatio", serversWithMetrics ? maxFreeRatio : -1.0);
 }
 
 void DDTeamCollection::updateTeamPivotValues() {
@@ -4539,6 +4638,31 @@ void DDTeamCollection::resetLocalitySet() {
 		it.second->localityEntry =
 		    storageServerMap->add(it.second->getLastKnownInterface().locality, &it.second->getId());
 	}
+}
+
+int DDTeamCollection::getHighestTeamPriority() const {
+	if (teamCollections.empty()) {
+		return -1;
+	}
+	int highestPriority = 0;
+	for (const auto* collection : teamCollections) {
+		if (collection == nullptr || !collection->initialFailureReactionDelay.isReady()) {
+			return -1;
+		}
+		// Team health is updated independently of relocation admission and completion. Include both regions
+		// and conservatively keep counting degraded teams until their trackers are retired.
+		int collectionPriority = -1;
+		for (const auto& [priority, count] : collection->priority_teams) {
+			if (count > 0) {
+				collectionPriority = std::max(collectionPriority, priority);
+			}
+		}
+		if (collectionPriority < 0) {
+			return -1;
+		}
+		highestPriority = std::max(highestPriority, collectionPriority);
+	}
+	return highestPriority;
 }
 
 bool DDTeamCollection::satisfiesPolicy(const std::vector<Reference<TCServerInfo>>& team, int amount) const {
@@ -5240,7 +5364,7 @@ void DDTeamCollection::rebuildMachineLocalityMap() {
 	for (auto& [_, machine] : machine_info) {
 		if (machine->serversOnMachine.empty()) {
 			TraceEvent(SevWarn, "RebuildMachineLocalityMapError")
-			    .detail("Machine", machine->machineID.toString())
+			    .detail("MachineID", machine->machineID.toString())
 			    .detail("NumServersOnMachine", 0);
 			continue;
 		}
@@ -5251,7 +5375,7 @@ void DDTeamCollection::rebuildMachineLocalityMap() {
 		auto& locality = representativeServer->getLastKnownInterface().locality;
 		if (!isValidLocality(configuration.storagePolicy, locality)) {
 			TraceEvent(SevWarn, "RebuildMachineLocalityMapError")
-			    .detail("Machine", machine->machineID.toString())
+			    .detail("MachineID", machine->machineID.toString())
 			    .detail("InvalidLocality", locality.toString());
 			continue;
 		}
@@ -6333,7 +6457,7 @@ bool DDTeamCollection::exclusionSafetyCheck(std::vector<UID>& excludeServerIDs) 
 
 std::pair<StorageWiggler::State, double> DDTeamCollection::getStorageWigglerState() const {
 	if (storageWiggler) {
-		return { storageWiggler->getWiggleState(), storageWiggler->lastStateChangeTs };
+		return storageWiggler->getWiggleStateSnapshot();
 	}
 	return { StorageWiggler::INVALID, 0.0 };
 }
@@ -6869,6 +6993,10 @@ public:
 		collection->addTeam(std::set<UID>({ UID(2, 0), UID(3, 0), UID(4, 0) }), IsInitialTeam::True);
 		collection->disableBuildingTeams();
 		collection->setCheckTeamDelay();
+		// Force the eligibility survey: updateTeamPivotValues() only refreshes once
+		// DD_TEAM_PIVOT_UPDATE_DELAY has elapsed, so without this the case depends on how much time
+		// earlier tests consumed and fails when run alone.
+		collection->teamPivots.lastPivotValuesUpdate = -100;
 
 		collection->server_info[UID(1, 0)]->setMetrics(high_avail);
 		collection->server_info[UID(2, 0)]->setMetrics(low_avail);
@@ -6925,6 +7053,8 @@ public:
 		collection->addTeam(std::set<UID>({ UID(3, 0), UID(4, 0), UID(5, 0) }), IsInitialTeam::True);
 		collection->disableBuildingTeams();
 		collection->setCheckTeamDelay();
+		// Force the eligibility survey; see GetTeam_ServerUtilizationBelowCutoff.
+		collection->teamPivots.lastPivotValuesUpdate = -100;
 
 		collection->server_info[UID(1, 0)]->setMetrics(high_avail);
 		collection->server_info[UID(2, 0)]->setMetrics(low_avail);
@@ -6952,6 +7082,154 @@ public:
 		const auto& [resTeam, srcTeamFound] = req.reply.getFuture().get();
 
 		ASSERT(!resTeam.present());
+	}
+
+	// Above AVAILABLE_SPACE_RATIO_CUTOFF the free-space multiplier is identically 1.0, so destination
+	// ranking degenerates to absolute bytes: a team at 10% free is preferred over one at 90% free if it
+	// holds slightly fewer bytes. Free space is an eligibility floor, not a gradient, so nothing pushes
+	// DD to level utilization between two teams that both have room.
+	//
+	// If free space is ever given influence above the cutoff this test should fail: invert the
+	// expectation to the roomier team rather than deleting the case, so the policy change stays visible.
+	static Future<Void> GetTeam_FreeSpaceIgnoredAboveCutoff() {
+		Reference<IReplicationPolicy> policy = makeReference<PolicyAcross>(3, "zoneid", makeReference<PolicyOne>());
+		int processSize = 6;
+		int teamSize = 3;
+		std::unique_ptr<DDTeamCollection> collection = testTeamCollection(teamSize, policy, processSize);
+
+		const int64_t MB = 1024LL * 1024;
+		const int64_t capacity = 10000 * MB;
+
+		// 90% free, holding 100 MB.
+		GetStorageMetricsReply roomy;
+		roomy.capacity.bytes = capacity;
+		roomy.available.bytes = 9000 * MB;
+		roomy.load.bytes = 100 * MB;
+
+		// 10% free, holding 90 MB. Stays above MIN_AVAILABLE_SPACE_RATIO +
+		// MIN_AVAILABLE_SPACE_RATIO_SAFETY_BUFFER (0.06), so it remains an eligible destination.
+		GetStorageMetricsReply nearlyFull;
+		nearlyFull.capacity.bytes = capacity;
+		nearlyFull.available.bytes = 1000 * MB;
+		nearlyFull.load.bytes = 90 * MB;
+
+		collection->addTeam(std::set<UID>({ UID(1, 0), UID(2, 0), UID(3, 0) }), IsInitialTeam::True);
+		collection->addTeam(std::set<UID>({ UID(4, 0), UID(5, 0), UID(6, 0) }), IsInitialTeam::True);
+		collection->disableBuildingTeams();
+		collection->setCheckTeamDelay();
+
+		for (int id = 1; id <= 3; ++id) {
+			collection->server_info[UID(id, 0)]->setMetrics(roomy);
+		}
+		for (int id = 4; id <= 6; ++id) {
+			collection->server_info[UID(id, 0)]->setMetrics(nearlyFull);
+		}
+
+		// Force the first refresh, or destination eligibility is never computed and this asserts
+		// nothing: DD_TEAM_PIVOT_UPDATE_DELAY never elapses while now() is still near zero.
+		collection->teamPivots.lastPivotValuesUpdate = -100;
+
+		// Both teams are healthy, so the pivot is the median of {0.90, 0.10} = 0.10, which the
+		// nearly-full team meets exactly: both are eligible and the choice is made purely on bytes.
+		GetTeamRequest req(TeamSelect::WANT_TRUE_BEST,
+		                   PreferLowerDiskUtil::True,
+		                   TeamMustHaveShards::False,
+		                   PreferLowerReadUtil::False,
+		                   PreferWithinShardLimit::False);
+
+		co_await collection->getTeam(req);
+
+		const auto& [resTeam, srcFound] = req.reply.getFuture().get();
+
+		ASSERT(resTeam.present());
+		auto ids = resTeam.get()->getServerIDs();
+		const std::set<UID> selected(ids.begin(), ids.end());
+
+		// Asking for the least-utilized team yields the one with 10% free, not the one with 90%.
+		const std::set<UID> nearlyFullTeam{ UID(4, 0), UID(5, 0), UID(6, 0) };
+		ASSERT(selected == nearlyFullTeam);
+		ASSERT_LT(resTeam.get()->getMinAvailableSpaceRatio(), 0.5);
+	}
+
+	// A destination team must be *fully* healthy, so during a migration a brand-new empty server whose
+	// teams all still contain an excluded member has no eligible destination team and receives nothing,
+	// however much free space it has: DD prefers a half-full healthy team to an empty unhealthy one.
+	// Health filtering is right in itself; what this pins down is that per-team eligibility turns "not
+	// the best destination" into "not a destination at all" until those teams are rebuilt.
+	//
+	// trackTeamHealth does not run in these fixtures, so the team is marked unhealthy directly and
+	// server_status is set only to document intent.
+	//
+	// A change that lets such a server receive data should fail this case: update the expectation
+	// rather than deleting it.
+	static Future<Void> GetTeam_UnhealthyTeamStrandsEmptyServer() {
+		Reference<IReplicationPolicy> policy = makeReference<PolicyAcross>(3, "zoneid", makeReference<PolicyOne>());
+		int processSize = 6;
+		int teamSize = 3;
+		std::unique_ptr<DDTeamCollection> collection = testTeamCollection(teamSize, policy, processSize);
+
+		const int64_t MB = 1024LL * 1024;
+		const int64_t capacity = 10000 * MB;
+
+		// Surviving old hosts: half full, and holding real data.
+		GetStorageMetricsReply loaded;
+		loaded.capacity.bytes = capacity;
+		loaded.available.bytes = 5000 * MB;
+		loaded.load.bytes = 500 * MB;
+
+		// Freshly added hosts: empty.
+		GetStorageMetricsReply empty;
+		empty.capacity.bytes = capacity;
+		empty.available.bytes = 9900 * MB;
+		empty.load.bytes = 0;
+
+		collection->addTeam(std::set<UID>({ UID(1, 0), UID(2, 0), UID(3, 0) }), IsInitialTeam::True);
+		collection->addTeam(std::set<UID>({ UID(4, 0), UID(5, 0), UID(6, 0) }), IsInitialTeam::True);
+		collection->disableBuildingTeams();
+		collection->setCheckTeamDelay();
+
+		for (int id = 1; id <= 3; ++id) {
+			collection->server_info[UID(id, 0)]->setMetrics(loaded);
+		}
+		for (int id = 4; id <= 6; ++id) {
+			collection->server_info[UID(id, 0)]->setMetrics(empty);
+		}
+
+		// Server 4 stands in for a still-excluded old host teamed with new servers 5 and 6; server 6 is
+		// the new host expected to be stranded.
+		const UID excludedServer(4, 0);
+		collection->server_status.set(
+		    excludedServer,
+		    ServerStatus(IsFailed::False,
+		                 IsUndesired::True,
+		                 IsWiggling::False,
+		                 collection->server_info[excludedServer]->getLastKnownInterface().locality));
+		collection->server_info[excludedServer]->markTeamUnhealthy(0);
+
+		// Force the pivot refresh, so the empty team is proven rejected on health rather than merely
+		// left uncomputed.
+		collection->teamPivots.lastPivotValuesUpdate = -100;
+
+		GetTeamRequest req(TeamSelect::WANT_TRUE_BEST,
+		                   PreferLowerDiskUtil::True,
+		                   TeamMustHaveShards::False,
+		                   PreferLowerReadUtil::False,
+		                   PreferWithinShardLimit::False);
+
+		co_await collection->getTeam(req);
+
+		const auto& [resTeam, srcFound] = req.reply.getFuture().get();
+
+		ASSERT(resTeam.present());
+		auto ids = resTeam.get()->getServerIDs();
+		const std::set<UID> selected(ids.begin(), ids.end());
+
+		// The half-full team is chosen and the empty one is never offered, so the empty servers cannot
+		// converge toward the rest of the cluster.
+		const std::set<UID> loadedTeam{ UID(1, 0), UID(2, 0), UID(3, 0) };
+		ASSERT(selected == loadedTeam);
+		ASSERT(!selected.contains(UID(6, 0)));
+		ASSERT_GT(resTeam.get()->getLoadBytes(false), 0);
 	}
 
 	static Future<Void> GetTeam_TrueBestLeastReadBandwidth() {
@@ -7240,6 +7518,28 @@ public:
 		co_await delay(0);
 	}
 
+	struct TimedRelocation {
+		double receivedAt;
+		RelocateShard request;
+	};
+
+	static Future<std::vector<TimedRelocation>> observePeriodicRelocations(
+	    FutureStream<RelocateShard> relocations,
+	    Reference<AsyncVar<bool>> processingUnhealthy) {
+		std::vector<TimedRelocation> observed;
+		observed.reserve(4);
+		for (int i = 0; i < 4; ++i) {
+			RelocateShard request = co_await relocations;
+			observed.push_back({ now(), std::move(request) });
+		}
+
+		// Close the observation window, then unwind the synchronous output.send() callback before
+		// the caller can destroy the collection.
+		processingUnhealthy->set(true);
+		co_await delay(0);
+		co_return observed;
+	}
+
 	static Future<Void> StorageServerFailureTracker_ReadyRecoverySkipsRemovalCheck() {
 		auto collection = testTeamCollection(1, makeReference<PolicyOne>(), 1);
 		auto txnProcessor = makeReference<DDTeamCollectionTestTxnProcessor>(collection->dbContext());
@@ -7441,6 +7741,22 @@ public:
 		ASSERT_EQ(relocations.pop().keys, mergedRange);
 		ASSERT(!relocations.isReady());
 
+		// A brief full/clear flap can be caused by a duplicate crossing the pipeline gate. It must not
+		// immediately clear submitted ranges and feed another duplicate back into the gate.
+		for (int i = 0; i < 3; ++i) {
+			collection->pipelineFull->set(true);
+			co_await delay(0.002);
+			collection->pipelineFull->set(false);
+			co_await delay(0.002);
+			ASSERT(!relocations.isReady());
+		}
+		co_await delay(checkTeamDelay + 0.01);
+		ASSERT(relocations.isReady());
+		ASSERT_EQ(relocations.pop().keys, mergedRange);
+		ASSERT(relocations.isReady());
+		ASSERT_EQ(relocations.pop().keys, mergedRange);
+		ASSERT(!relocations.isReady());
+
 		collection->processingUnhealthy->set(true);
 		co_await delay(checkTeamDelay + 0.01);
 		ASSERT(!relocations.isReady());
@@ -7497,11 +7813,19 @@ public:
 		ASSERT_EQ(relocations.pop().priority, SERVER_KNOBS->PRIORITY_TEAM_FAILED);
 		ASSERT(!relocations.isReady());
 
-		co_await delay(checkTeamDelay + 0.01);
-		ASSERT(relocations.isReady());
-		ASSERT_EQ(relocations.pop().priority, SERVER_KNOBS->PRIORITY_TEAM_FAILED);
-		ASSERT(relocations.isReady());
-		ASSERT_EQ(relocations.pop().priority, SERVER_KNOBS->PRIORITY_TEAM_FAILED);
+		// A buggified observation delay can span multiple valid retry intervals. Observe the next
+		// four retries continuously and check that two trackers cannot send three requests within
+		// one polling interval.
+		const auto periodicRetries =
+		    co_await timeoutError(observePeriodicRelocations(relocations, collection->processingUnhealthy), 5.0);
+		for (const auto& retry : periodicRetries) {
+			ASSERT_EQ(retry.request.keys, mergedRange);
+			ASSERT_EQ(retry.request.priority, SERVER_KNOBS->PRIORITY_TEAM_FAILED);
+		}
+		for (size_t i = 2; i < periodicRetries.size(); ++i) {
+			ASSERT_GE(periodicRetries[i].receivedAt + INetwork::TIME_EPS,
+			          periodicRetries[i - 2].receivedAt + checkTeamDelay);
+		}
 		ASSERT(!relocations.isReady());
 		ASSERT_NE(latestEventCache.get(collection->teamCollectionInfoEventHolder->trackingKey).getValue("Time"),
 		          initialTeamCollectionInfoTime);
@@ -7584,6 +7908,14 @@ TEST_CASE("/DataDistribution/GetTeam/ServerUtilizationNearCutoff") {
 	co_await DDTeamCollectionUnitTest::GetTeam_ServerUtilizationNearCutoff();
 }
 
+TEST_CASE("/DataDistribution/GetTeam/FreeSpaceIgnoredAboveCutoff") {
+	co_await DDTeamCollectionUnitTest::GetTeam_FreeSpaceIgnoredAboveCutoff();
+}
+
+TEST_CASE("/DataDistribution/GetTeam/UnhealthyTeamStrandsEmptyServer") {
+	co_await DDTeamCollectionUnitTest::GetTeam_UnhealthyTeamStrandsEmptyServer();
+}
+
 TEST_CASE("/DataDistribution/GetTeam/TrueBestLeastReadBandwidth") {
 	co_await DDTeamCollectionUnitTest::GetTeam_TrueBestLeastReadBandwidth();
 }
@@ -7593,7 +7925,7 @@ TEST_CASE("/DataDistribution/GetTeam/DeprioritizeWigglePausedTeam") {
 }
 
 TEST_CASE("/DataDistribution/StorageWiggler/NextIdWithMinAge") {
-	Reference<StorageWiggler> wiggler = makeReference<StorageWiggler>(nullptr);
+	auto wiggler = makeReference<StorageWiggler>(nullptr);
 	double startTime = now();
 	wiggler->addServer(UID(1, 0),
 	                   StorageMetadataType(startTime - SERVER_KNOBS->DD_STORAGE_WIGGLE_MIN_SS_AGE_SEC + 5.0,
@@ -7645,7 +7977,7 @@ TEST_CASE("/DataDistribution/StorageWiggler/NextIdWithMinAge") {
 TEST_CASE("/DataDistribution/StorageWiggler/NextIdWithTSS") {
 	std::unique_ptr<DDTeamCollection> collection =
 	    DDTeamCollectionUnitTest::testMachineTeamCollection(1, makeReference<PolicyOne>(), 5);
-	Reference<StorageWiggler> wiggler = makeReference<StorageWiggler>(collection.get());
+	auto wiggler = makeReference<StorageWiggler>(collection.get());
 
 	std::cout << "Test when need TSS ... \n";
 	collection->configuration.usableRegions = 1;

@@ -18,7 +18,7 @@
  * limitations under the License.
  */
 
-#include "fdbclient/NativeAPI.actor.h"
+#include "fdbclient/NativeAPI.h"
 #include "fdbserver/core/TesterInterface.h"
 #include "fdbserver/tester/workloads.h"
 #include "fdbrpc/simulator.h"
@@ -112,7 +112,7 @@ struct TargetedKillWorkload : TestWorkload {
 				machine = mpi.address();
 				if (machine != self->dbInfo->get().clusterInterface.getWorkers.getEndpoint().getPrimaryAddress())
 					break;
-				o = ++o % commitProxies->size();
+				o = (o + 1) % commitProxies->size();
 			}
 		} else if (self->machineToKill == "grvproxy") {
 			auto grvProxies = cx->getGrvProxies(UseProvisionalProxies::False);
@@ -122,7 +122,7 @@ struct TargetedKillWorkload : TestWorkload {
 				machine = gpi.address();
 				if (machine != self->dbInfo->get().clusterInterface.getWorkers.getEndpoint().getPrimaryAddress())
 					break;
-				o = ++o % grvProxies->size();
+				o = (o + 1) % grvProxies->size();
 			}
 		} else if (self->machineToKill == "tlog") {
 			auto tlogs = self->dbInfo->get().logSystemConfig.allPresentLogs();
@@ -132,7 +132,7 @@ struct TargetedKillWorkload : TestWorkload {
 				machine = tli.address();
 				if (machine != self->dbInfo->get().clusterInterface.getWorkers.getEndpoint().getPrimaryAddress())
 					break;
-				o = ++o % tlogs.size();
+				o = (o + 1) % tlogs.size();
 			}
 		} else if (self->machineToKill == "storage" || self->machineToKill == "ss" ||
 		           self->machineToKill == "storageserver") {
@@ -148,7 +148,7 @@ struct TargetedKillWorkload : TestWorkload {
 					if (killed == self->numKillStorages)
 						co_return;
 				}
-				s = ++s % storageServers.size();
+				s = (s + 1) % storageServers.size();
 			}
 		} else if (self->machineToKill == "clustercontroller" || self->machineToKill == "cc") {
 			machine = self->dbInfo->get().clusterInterface.getWorkers.getEndpoint().getPrimaryAddress();
