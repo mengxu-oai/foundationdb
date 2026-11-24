@@ -23,7 +23,7 @@
 #include "fdbcli/fdbcli.h"
 
 #include "fdbclient/FDBTypes.h"
-#include "fdbclient/NativeAPI.actor.h"
+#include "fdbclient/NativeAPI.h"
 
 #include "flow/CoroUtils.h"
 
@@ -31,7 +31,7 @@ namespace fdb_cli {
 
 std::string toHex(StringRef v) {
 	std::string result;
-	result.reserve(v.size() * 4);
+	result.reserve(static_cast<std::string::size_type>(v.size()) * 4);
 	for (int i = 0; i < v.size(); i++) {
 		result.append(format("\\x%02x", v[i]));
 	}
@@ -166,12 +166,17 @@ Future<bool> getallCommandActor(Database cx, std::vector<StringRef> tokens, Vers
 			replies.push_back(locations->get(i, &StorageServerInterface::getValue).getReply(req));
 		}
 		co_await waitForAll(replies);
+		UID auditId = deterministicRandom()->randomUniqueID();
 		for (int i = 0; i < replies.size(); i++) {
 			std::string ssi = locations->getInterface(i).address().toString();
 			if (replies[i].isError()) {
 				fmt::println(stderr, "ERROR: {} {}", ssi, replies[i].getError().what());
 			} else {
 				Optional<Value> v = replies[i].get().value;
+				if (v.present()) {
+					auditLogReturnedKey(
+					    cx, "getall", auditId, tokens[1], v.get(), locations->getInterface(i).address());
+				}
 				fmt::println(" {} {}", ssi, v.present() ? printable(v.get()) : "(not found)");
 			}
 		}

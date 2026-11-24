@@ -18,7 +18,7 @@
  * limitations under the License.
  */
 
-#include "fdbclient/NativeAPI.actor.h"
+#include "fdbclient/NativeAPI.h"
 #include "fdbserver/core/TesterInterface.h"
 #include "BulkSetup.h"
 #include "fdbclient/ReadYourWrites.h"
@@ -70,7 +70,7 @@ struct WatchAndWaitWorkload : TestWorkload {
 		}
 
 		double d = double(index) / nodeCount;
-		emplaceIndex(data, idx, *(int64_t*)&d);
+		emplaceIndex(data, idx, std::bit_cast<int64_t>(d));
 
 		return result;
 	}

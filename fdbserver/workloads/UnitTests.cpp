@@ -45,7 +45,6 @@ void forceLinkDDSketchTests();
 void forceLinkCommitProxyTests();
 void forceLinkWipedStringTests();
 void forceLinkRandomKeyValueUtilsTests();
-void forceLinkActorFuzzUnitTests();
 void forceLinkGrpcTests();
 void forceLinkGrpcTests2();
 void forceLinkSimpleCounterTests();
@@ -54,6 +53,11 @@ void forceLinkIPagerTests();
 void forceLinkMockS3ServerTests();
 void forceLinkAuditUtilsTests();
 void forceLinkShardsAffectedByTeamFailureTests();
+void forceLinkNativeCdcBalancerTests();
+void forceLinkNativeCdcRetagCleanupTests();
+void forceLinkNativeCdcMetadataTests();
+void forceLinkNativeCdcOrderedMergeTests();
+void forceLinkNativeCdcOrderedMetadataTests();
 void forceLinkClusterHealthMonitorTests();
 void forceLinkGrvQueueDelayTests();
 void forceLinkGrvProxyStarvationTests();
@@ -127,13 +131,17 @@ struct UnitTestWorkload : TestWorkload {
 		forceLinkDDSketchTests();
 		forceLinkWipedStringTests();
 		forceLinkRandomKeyValueUtilsTests();
-		forceLinkActorFuzzUnitTests();
 		forceLinkSimpleCounterTests();
 		forceLinkLogSystemRecoveryTests();
 		forceLinkIPagerTests();
 		forceLinkMockS3ServerTests();
 		forceLinkAuditUtilsTests();
 		forceLinkShardsAffectedByTeamFailureTests();
+		forceLinkNativeCdcBalancerTests();
+		forceLinkNativeCdcRetagCleanupTests();
+		forceLinkNativeCdcMetadataTests();
+		forceLinkNativeCdcOrderedMergeTests();
+		forceLinkNativeCdcOrderedMetadataTests();
 		forceLinkClusterHealthMonitorTests();
 		forceLinkGrvQueueDelayTests();
 		forceLinkGrvProxyStarvationTests();
@@ -220,10 +228,12 @@ struct UnitTestWorkload : TestWorkload {
 			    .detail("Rand", deterministicRandom()->randomInt(0, 100001));
 
 			Error result = success();
+			platform::createDirectory(testParams.getDataDir());
+			// Yield so Net2 refreshes now() after synchronous tests and directory I/O.
+			co_await delay(0);
 			double start_now = now();
 			double start_timer = timer();
 
-			platform::createDirectory(testParams.getDataDir());
 			try {
 				co_await test->func(testParams);
 			} catch (Error& e) {
